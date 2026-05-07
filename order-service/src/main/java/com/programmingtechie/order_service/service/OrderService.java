@@ -5,9 +5,13 @@ import com.programmingtechie.order_service.domain.OrderLineItems;
 import com.programmingtechie.order_service.dtos.InventoryResponse;
 import com.programmingtechie.order_service.dtos.OrderLineItemsRequest;
 import com.programmingtechie.order_service.dtos.OrderRequest;
+import com.programmingtechie.order_service.event.OrderPlacedEvent;
 import com.programmingtechie.order_service.repository.OrderRepository;
+import io.micrometer.tracing.Span;
+import io.micrometer.tracing.Tracer;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -26,6 +30,10 @@ public class OrderService {
     @Autowired
     @Qualifier("webClientInventory")
     private WebClient.Builder webClientBuilder;
+    @Autowired
+    private Tracer tracer;
+    @Autowired
+    private KafkaTemplate<String, OrderPlacedEvent> kafkaTemplate;
 
 
     public String placeOrder(OrderRequest orderRequest){
@@ -39,22 +47,33 @@ public class OrderService {
 
         List<String> skuCodes = order.getOrderLineItems().stream().map(OrderLineItems::getSkuCode).toList();
 
-        /// Call Inventory Service to see if order is in stock
-        //explicacao::, retrieve acredito que torna ele synchronous e se fosse asynchronous ele nao iria devolver nada
-        // bodyToMono esta a especificar qual e o tipo de dado que esta a receber?
-        InventoryResponse[] result = webClientBuilder.build().get()
-                .uri("http://inventory-service/api/inventory", uriBuilder -> uriBuilder.queryParam("skuCode", skuCodes).build())
-                .retrieve()
-                .bodyToMono(InventoryResponse[].class)
-                .block();
+        //Atribuir nome ao span que acontece neste request something like that
+        Span inventoryServiceLookup = tracer.nextSpan().name("InventoryServiceLookup");
 
-        boolean allProductsInStrock = Arrays.stream(result).allMatch(InventoryResponse::isInStock);
+        try (Tracer.SpanInScope spanInScope = tracer.withSpan(inventoryServiceLookup.start())){
 
-        if(allProductsInStrock) {
-            orderRepository.save(order);
-            return "Order Successfully Created!!";
+            /// Call Inventory Service to see if order is in stock
+            //explicacao::, retrieve acredito que torna ele synchronous e se fosse asynchronous ele nao iria devolver nada
+            // bodyToMono esta a especificar qual e o tipo de dado que esta a receber?
+            InventoryResponse[] result = webClientBuilder.build().get()
+                    .uri("http://inventory-service/api/inventory", uriBuilder -> uriBuilder.queryParam("skuCode", skuCodes).build())
+                    .retrieve()
+                    .bodyToMono(InventoryResponse[].class)
+                    .block();
+
+            boolean allProductsInStrock = Arrays.stream(result).allMatch(InventoryResponse::isInStock);
+
+            if(allProductsInStrock) {
+                orderRepository.save(order);
+                kafkaTemplate.send("notificationTopic",new OrderPlacedEvent(order.getOrderNumber()));
+                return "Order Successfully Created!!";
+            }
+            else throw new IllegalArgumentException("Product Is Not In Stock Try Again Later");
         }
-        else throw new IllegalArgumentException("Product Is Not In Stock Try Again Later");
+        finally {
+            inventoryServiceLookup.end();
+        }
+
     }
 
 
